@@ -121,15 +121,26 @@ async def register_with_central(agent_url: str):
     """중앙 서버에 Agent URL 등록"""
     await asyncio.sleep(3)  # 서버가 요청을 받을 수 있을 때까지 대기
     try:
+        payload = {
+            "agent_url": agent_url,
+            "exchange": settings.exchange,
+            "partner_code": settings.partner_code,
+        }
+        payload_bytes = json.dumps(payload, sort_keys=True).encode()
+        sig = hmac.new(
+            settings.token_secret.encode(),
+            payload_bytes,
+            hashlib.sha256,
+        ).hexdigest()
         async with httpx.AsyncClient(verify=True, timeout=10.0) as client:
             resp = await client.post(
                 f"{settings.central_url_normalized}/api/agent/register",
-                json={
-                    "agent_url": agent_url,
-                    "agent_token": settings.agent_token,
-                    "exchange": settings.exchange,
-                    "partner_code": settings.partner_code,
-                }
+                content=payload_bytes,
+                headers={
+                    "Authorization": f"Bearer {settings.agent_token}",
+                    "X-Agent-Signature": sig,
+                    "Content-Type": "application/json",
+                },
             )
             if resp.status_code == 200:
                 logger.info("Successfully registered with central server")
