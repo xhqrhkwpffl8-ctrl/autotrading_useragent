@@ -46,6 +46,7 @@ _exchange_client: Optional[AgentExchangeClient] = None
 # ===== 수동 포지션 감지 상태 =====
 _known_positions: Dict[str, Optional[dict]] = {}   # symbol → position dict (None = no position)
 _bot_executed_symbols: set = set()                  # 봇이 market_entry 실행한 심볼 (수동 오감지 방지)
+_trailing_stop_active: set = set()                  # trailing stop이 활성화된 심볼 집합
 
 
 def get_exchange_client() -> AgentExchangeClient:
@@ -201,11 +202,13 @@ async def _notify_manual_position(symbol: str, pos: dict, is_addon: bool):
     await _post_to_central("/api/agent/manual-position", payload)
 
 
-async def _notify_position_closed(symbol: str):
-    """청산 콜백 — Bybit에서 closed PnL 조회 후 전송"""
+async def _notify_position_closed(symbol: str, exit_reason_override: Optional[str] = None):
+    """청산 콜백 — closed PnL 조회 후 전송. exit_reason_override가 있으면 우선 적용."""
     import time
     client = get_exchange_client()
     payload: dict = {"symbol": symbol}
+    if exit_reason_override:
+        payload["exit_reason"] = exit_reason_override
     pnl_info = None
     detected_at_ms = int(time.time() * 1000)  # 포지션 청산 감지 시각
 
@@ -243,11 +246,13 @@ async def _notify_position_closed(symbol: str):
                     f.get("orderType") == "Limit" and not f.get("stopOrderType")
                     for f in recent_fills
                 )
-                if any_sl:
-                    payload["exit_reason"] = "SL_HIT"
-                elif not any_tp_limit:
-                    payload["exit_reason"] = "MANUAL_CLOSE"
-                # TP Limit 체결: exit_reason 미포함 → 서버 tp_filled DB 판단
+                # exit_reason_override가 있으면 fills 판정 결과로 덮어쓰지 않음
+                if "exit_reason" not in payload:
+                    if any_sl:
+                        payload["exit_reason"] = "SL_HIT"
+                    elif not any_tp_limit:
+                        payload["exit_reason"] = "MANUAL_CLOSE"
+                    # TP Limit 체결: exit_reason 미포함 → 서버 tp_filled DB 판단
                 logger.info(
                     f"[ManualDetect] exit_reason={payload.get('exit_reason', 'none(TP)')} (stopOrderType check)"
                 )
@@ -267,16 +272,17 @@ async def _notify_position_closed(symbol: str):
                 total_fee = sum(float(f.get("execFee", 0)) for f in recent)
                 if total_fee > 0:
                     payload["commission"] = str(round(total_fee, 8))
-                # stopOrderType / orderType으로 exit_reason 판정
-                any_sl = any(f.get("stopOrderType") == "StopLoss" for f in recent)
-                any_tp_limit = any(
-                    f.get("orderType") == "Limit" and not f.get("stopOrderType")
-                    for f in recent
-                )
-                if any_sl:
-                    payload["exit_reason"] = "SL_HIT"
-                elif not any_tp_limit:
-                    payload["exit_reason"] = "MANUAL_CLOSE"
+                # exit_reason_override가 있으면 fills 판정 결과로 덮어쓰지 않음
+                if "exit_reason" not in payload:
+                    any_sl = any(f.get("stopOrderType") == "StopLoss" for f in recent)
+                    any_tp_limit = any(
+                        f.get("orderType") == "Limit" and not f.get("stopOrderType")
+                        for f in recent
+                    )
+                    if any_sl:
+                        payload["exit_reason"] = "SL_HIT"
+                    elif not any_tp_limit:
+                        payload["exit_reason"] = "MANUAL_CLOSE"
                 logger.info(
                     f"[ManualDetect] exit_reason={payload.get('exit_reason', 'none(TP)')} (fills fallback stopOrderType check)"
                 )
@@ -358,7 +364,7 @@ async def _notify_tp_filled(symbol: str, pos: dict, prev_qty: float, curr_qty: f
 
 async def detect_manual_positions():
     """30초마다 포지션 폴링 — 수동 진입/추가매수/청산 감지 + MAE/MFE heartbeat"""
-    global _known_positions, _bot_executed_symbols
+    global _known_positions, _bot_executed_symbols, _trailing_stop_active
     await asyncio.sleep(15)  # 시작 직후 1회 초기화
     client = get_exchange_client()
 
@@ -425,8 +431,30 @@ async def detect_manual_positions():
                 if symbol not in current_map:
                     known = _known_positions[symbol]
                     prev_qty = float(known.get("contracts", 0) or 0)
+                    had_trailing_stop = symbol in _trailing_stop_active  # 청산 전 상태 캡처
 
-                    # SL vs TP 구분: recent fills의 orderType으로 판단
+                    # cancel_all_orders 이전에 trailing stop pending 여부 확인
+                    # 발동했으면 Bitget open orders에 없음 → trailing_stop_fired=True
+                    # 수동청산/SL이면 아직 pending → trailing_stop_fired=False
+                    trailing_stop_fired = False
+                    if had_trailing_stop:
+                        trailing_stop_pending = await client.has_pending_trailing_stop(symbol)
+                        trailing_stop_fired = not trailing_stop_pending
+                        logger.info(
+                            f"[ManualDetect] trailing stop 상태: "
+                            f"pending={trailing_stop_pending}, fired={trailing_stop_fired} ({symbol})"
+                        )
+
+                    # Pending 상태 plan order(trailing stop 포함) 명시적 취소
+                    # Bitget은 포지션 청산 시 plan order를 자동으로 취소하지 않음
+                    try:
+                        await client.cancel_all_orders(symbol)
+                    except Exception as e:
+                        logger.warning(f"[ManualDetect] 청산 후 주문 취소 실패: {symbol}: {e}")
+                    _trailing_stop_active.discard(symbol)
+
+                    # SL vs TP vs TRAILING_STOP 구분
+                    detected_exit_reason = None
                     if prev_qty > 1e-9:
                         is_tp_fill = False
                         try:
@@ -436,19 +464,25 @@ async def detect_manual_positions():
                                 order_type = latest.get("orderType", "")
                                 stop_order_type = latest.get("stopOrderType", "")
                                 # TP limit order: orderType="Limit", stopOrderType 없음
-                                # SL market order: orderType="Market" 또는 stopOrderType 있음
+                                # SL market order: orderType="Market" + stopOrderType="StopLoss"
+                                # Trailing stop: trailing_stop_fired=True (cancel 전 open orders 조회로 확정)
                                 is_tp_fill = (order_type == "Limit" and not stop_order_type)
+                                if trailing_stop_fired and not is_tp_fill:
+                                    detected_exit_reason = "TRAILING_STOP"
+                                    logger.info(f"[ManualDetect] 트레일링 스탑 발동 감지: {symbol}")
                         except Exception:
                             logger.warning("[ManualDetect] fills 조회 실패, tp_filled 스킵")
 
                         if is_tp_fill:
                             logger.info(f"[ManualDetect] 포지션 소멸 (마지막 TP 체결): {symbol}")
                             await _notify_tp_filled(symbol, known, prev_qty, 0.0)
+                        elif detected_exit_reason == "TRAILING_STOP":
+                            logger.info(f"[ManualDetect] 포지션 소멸 (트레일링 스탑 발동): {symbol}")
                         else:
                             logger.info(f"[ManualDetect] 포지션 소멸 (SL/수동 청산): {symbol}")
 
                     logger.info(f"[ManualDetect] 포지션 청산 감지: {symbol}")
-                    await _notify_position_closed(symbol)
+                    await _notify_position_closed(symbol, exit_reason_override=detected_exit_reason)
                     del _known_positions[symbol]
 
         except Exception as e:
@@ -638,8 +672,9 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
                         "actual": actual,
                     }
 
-            # 미체결 주문 취소
+            # 미체결 주문 취소 (trailing stop 포함)
             await client.cancel_all_orders(symbol)
+            _trailing_stop_active.discard(symbol)
 
             # 포지션 청산
             position = await client.get_position(symbol)
@@ -665,11 +700,13 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
 
         elif request.order_type == "cancel_all":
             success = await client.cancel_all_orders(symbol)
+            _trailing_stop_active.discard(symbol)
             return {"success": success}
 
         elif request.order_type == "adjust":
             # 재조정: 기존 주문 전체 취소 → SL 설정 → TP/DCA 주문 재배치
             await client.cancel_all_orders(symbol)
+            _trailing_stop_active.discard(symbol)  # 기존 trailing stop 상태 초기화
 
             # 최신 포지션 조회 (DCA 체결로 인한 수량 변동 반영)
             position = await client.get_position(symbol)
@@ -677,7 +714,20 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
 
             sl_set = False
             if request.trailing_stop_distance:
+                if not position:
+                    # 포지션이 이미 소멸 — SL 발동 등으로 청산됨, position-closed 콜백이 곧 전송될 것
+                    logger.info(f"[adjust] position already gone, skipping trailing stop: {symbol}")
+                    return {"success": True, "position_qty": "0", "sl_set": False, "tp_order_ids": [], "dca_order_ids": []}
                 sl_set = await client.set_trailing_stop(symbol, request.trailing_stop_distance)
+                if not sl_set:
+                    # API 실패 — 백엔드가 Telegram 알림을 받을 수 있도록 명시적 실패 반환
+                    logger.error(f"[adjust] trailing stop placement failed: {symbol}")
+                    return {
+                        "success": False,
+                        "reason": "trailing_stop_failed",
+                        "position_qty": str(position_qty),
+                    }
+                _trailing_stop_active.add(symbol)  # 성공 시 추적 등록
             elif request.sl_price:
                 sl_set = await client.set_stop_loss(symbol, Decimal(str(request.sl_price)))
 

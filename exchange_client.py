@@ -469,13 +469,28 @@ class AgentExchangeClient:
                         f"[TrailingStop] callback_ratio {callback_ratio}% < 0.5% min → using 0.5%"
                     )
                     callback_ratio = 0.5
+                # triggerPrice: Bitget track_plan의 활성화 가격 (activation threshold)
+                # 활성화 후 Bitget은 활성화 시점 현재가부터 트래킹 시작 (triggerPrice 기준 아님)
+                #
+                # SELL (LONG 청산): 활성화 조건 = mark_price <= triggerPrice
+                #   mark_price * 2로 설정하면 현재가(73,000) <= 146,000 → 항상 즉시 활성화
+                #
+                # BUY (SHORT 청산): 활성화 조건 = mark_price >= triggerPrice
+                #   mark_price * 0.01로 설정하면 현재가(73,000) >= 730 → 항상 즉시 활성화
+                #   단, Bitget이 triggerPrice를 tracking 초기 LOW로 사용할 경우
+                #   730 × 1.005 = 733.65 이미 초과 → 즉시 발동 위험 (SHORT 케이스 테스트 필요)
+                if position.side == "LONG":
+                    trigger_price = round(mark_price * 2, 1)
+                else:
+                    # SHORT: triggerPrice를 낮게 → 즉시 활성화 (테스트 전 LONG 케이스 우선 검증)
+                    trigger_price = round(mark_price * 0.01, 4)
                 await self.exchange.private_mix_post_v2_mix_order_place_plan_order({
                     "symbol": symbol,
                     "productType": "USDT-FUTURES",
                     "marginMode": "crossed",
                     "marginCoin": "USDT",
                     "planType": "track_plan",
-                    "triggerPrice": str(mark_price),
+                    "triggerPrice": str(trigger_price),
                     "triggerType": "mark_price",
                     "callbackRatio": str(callback_ratio),
                     "size": str(position.qty),
@@ -490,6 +505,25 @@ class AgentExchangeClient:
         except Exception as e:
             logger.error(f"Failed to set trailing stop for {symbol}: {e}")
             return False
+
+    async def has_pending_trailing_stop(self, symbol: str) -> bool:
+        """Bitget open plan orders에서 track_plan(trailing stop)이 pending 상태인지 확인.
+        trailing stop 발동 여부 판별용 — 발동했으면 open orders에 없음(False), 미발동이면 있음(True).
+        비-Bitget 또는 조회 실패 시 True 반환(보수적: trailing stop 발동 아닌 것으로 간주).
+        → 호출부: trailing_stop_fired = not has_pending_trailing_stop()"""
+        if self.exchange_id != "bitget":
+            return True  # 비-Bitget: 판별 불가 → 보수적으로 pending(=발동 아님) 처리
+        try:
+            resp = await self.exchange.private_mix_get_v2_mix_order_orders_plan_pending({
+                "symbol": symbol,
+                "productType": "USDT-FUTURES",
+                "planType": "track_plan",
+            })
+            orders = (resp.get("data") or {}).get("entrustedList") or []
+            return len(orders) > 0
+        except Exception as e:
+            logger.warning(f"[TrailingStop] open plan orders 조회 실패 (보수적 처리): {e}")
+            return True  # 조회 실패 시 trailing stop 발동 아닌 것으로 간주
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         try:
