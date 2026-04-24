@@ -41,6 +41,9 @@ class AgentSettings(BaseSettings):
     # 서버 포트 (Railway 자동 제공)
     port: int = 8000
 
+    # A/B Test & Service Identity
+    agent_variant: str = "main"     # AGENT_VARIANT env var (main | abtest-b | abtest-c)
+
     @property
     def user_id(self) -> str:
         """토큰에서 user_id 추출 ({user_id}:{token_secret} 형식)"""

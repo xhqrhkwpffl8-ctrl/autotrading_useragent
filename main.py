@@ -46,6 +46,7 @@ _exchange_client: Optional[AgentExchangeClient] = None
 # ===== 수동 포지션 감지 상태 =====
 _known_positions: Dict[str, Optional[dict]] = {}   # symbol → position dict (None = no position)
 _bot_executed_symbols: set = set()                  # 봇이 market_entry 실행한 심볼 (수동 오감지 방지)
+_pending_bot_dca_ids: Dict[str, set] = {}          # 봇이 등록한 DCA 지정가 주문 ID (심볼 → set of order_id)
 _trailing_stop_active: set = set()                  # trailing stop이 활성화된 심볼 집합
 _known_sl_prices: Dict[str, str] = {}              # symbol → SL 가격 문자열 (MANUAL_CLOSE 오분류 방지)
 
@@ -115,7 +116,6 @@ class ExecuteRequest(BaseModel):
     order_id: Optional[str] = None
     expected_position_size: Optional[float] = None  # None = 검증 생략
     timestamp: str              # ISO 형식
-    hmac_signature: str
 
 
 # ===== 중앙 서버 등록 =====
@@ -189,8 +189,45 @@ async def _post_to_central(path: str, payload: dict):
         logger.error("[ManualDetect] 콜백 오류 발생")
 
 
-async def _notify_manual_position(symbol: str, pos: dict, is_addon: bool):
-    """신규진입 or 추가매수 콜백"""
+_NETWORK_ERROR_KEYWORDS = ("timeout", "connection", "network", "502", "503", "504")
+
+
+async def _post_error_to_central(error_type: str, file_name: str, function_name: str, message: str):
+    """오류를 메인서버에 리포팅 (네트워크 오류 제외, fire-and-forget)"""
+    if not settings.central_url:
+        return
+    msg_lower = message.lower()
+    if any(kw in msg_lower for kw in _NETWORK_ERROR_KEYWORDS):
+        return
+    try:
+        payload = {
+            "error_type": error_type,
+            "file_name": file_name,
+            "function_name": function_name,
+            "message": message[:500],
+        }
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode()
+        sig = hmac.new(
+            settings.token_secret.encode(),
+            payload_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+        async with httpx.AsyncClient(verify=True, timeout=10.0) as http:
+            await http.post(
+                f"{settings.central_url_normalized}/api/agent/error",
+                content=payload_bytes,
+                headers={
+                    "Authorization": f"Bearer {settings.agent_token}",
+                    "X-Agent-Signature": sig,
+                    "Content-Type": "application/json",
+                },
+            )
+    except Exception:
+        logger.warning("[AgentError] 오류 리포팅 실패 (무시)")
+
+
+async def _notify_manual_position(symbol: str, pos: dict, is_addon: bool, is_bot_dca: bool = False):
+    """신규진입 or 추가매수 콜백. is_bot_dca=True이면 서버에서 Telegram 생략, AI 재분석만 실행."""
     payload = {
         "symbol": symbol,
         "side": pos.get("side", ""),
@@ -198,6 +235,7 @@ async def _notify_manual_position(symbol: str, pos: dict, is_addon: bool):
         "entry_price": str(pos.get("entryPrice", "0")),
         "leverage": int(pos.get("leverage", 10)),
         "is_addon": is_addon,
+        "is_bot_dca": is_bot_dca,
         "mark_price": str(pos.get("markPrice") or "0"),
     }
     await _post_to_central("/api/agent/manual-position", payload)
@@ -435,6 +473,12 @@ async def detect_manual_positions():
                         if symbol in _bot_executed_symbols:
                             _bot_executed_symbols.discard(symbol)
                             logger.info(f"[ManualDetect] 봇 추가매수 감지 스킵: {symbol}")
+                        elif _pending_bot_dca_ids.get(symbol):
+                            _pending_bot_dca_ids[symbol].pop()
+                            if not _pending_bot_dca_ids[symbol]:
+                                del _pending_bot_dca_ids[symbol]
+                            logger.info(f"[ManualDetect] 봇 DCA 체결 감지: {symbol} — AI 재분석 트리거")
+                            await _notify_manual_position(symbol, pos, is_addon=True, is_bot_dca=True)
                         else:
                             logger.info(f"[ManualDetect] 수동 추가매수 감지: {symbol}")
                             await _notify_manual_position(symbol, pos, is_addon=True)
@@ -507,9 +551,11 @@ async def detect_manual_positions():
                     await _notify_position_closed(symbol, exit_reason_override=detected_exit_reason)
                     del _known_positions[symbol]
                     _known_sl_prices.pop(symbol, None)
+                    _pending_bot_dca_ids.pop(symbol, None)
 
         except Exception as e:
             logger.error(f"[ManualDetect] 폴링 오류: {e}")
+            await _post_error_to_central("logic_error", "main.py", "detect_manual_positions", str(e))
 
 
 async def _run_polling_supervisor():
@@ -519,6 +565,7 @@ async def _run_polling_supervisor():
             await detect_manual_positions()
         except Exception as e:
             logger.error(f"[ManualDetect] 루프 비정상 종료, 30초 후 재시작: {e}")
+            await _post_error_to_central("logic_error", "main.py", "_run_polling_supervisor", str(e))
             await asyncio.sleep(30)
 
 
@@ -566,31 +613,33 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @limiter.limit("30/minute")
 async def execute_order(request: Request, execute_req: ExecuteRequest):
     request_obj = request
+    raw_body = await request_obj.body()
     request = execute_req
     """
     중앙 서버에서 전달받은 주문 실행
 
     보안:
-    - HMAC-SHA256 서명 검증
+    - HMAC-SHA256 서명 검증 (raw body bytes vs X-Hmac-Signature 헤더)
     - Timestamp 60초 초과 거부
     - expected_position_size 검증 (포지션 불일치 감지)
     """
-    # 요청을 dict로 변환 (hmac_signature 검증용)
-    # exclude_unset=True: JSON에 없던 필드(Pydantic 기본값 None)를 제외해 메인서버 canonical과 일치시킴
-    payload = request.model_dump(exclude_unset=True)
-
     # 1. Timestamp 검증
-    if not check_timestamp(payload.get("timestamp", "")):
+    if not check_timestamp(request.timestamp):
         raise HTTPException(status_code=400, detail="Timestamp expired or invalid (max 60s)")
 
-    # 2. HMAC 서명 검증 (payload를 복사해서 검증 — pop하므로 원본 보존)
-    payload_copy = dict(payload)
-    if not verify_hmac_signature(payload_copy):
+    # 2. HMAC 서명 검증: raw body bytes 기반 (Pydantic 재직렬화 없음)
+    x_hmac_sig = request_obj.headers.get("x-hmac-signature", "")
+    expected = hmac.new(
+        settings.token_secret.encode(),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, x_hmac_sig):
         logger.warning(f"HMAC verification failed for order_type={request.order_type}")
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
 
     # 3. Nonce 중복 방지 (60초 창 내 동일 서명 재전송 차단)
-    sig_val = payload.get("hmac_signature", "")
+    sig_val = x_hmac_sig
     _now = time.time()
     expired_keys = [k for k, v in _used_nonces.items() if _now - v > 60]
     for k in expired_keys:
@@ -635,7 +684,8 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
                 await client.switch_to_one_way_mode(symbol)
                 await client.set_leverage(symbol, request.leverage)
 
-            # 시장가 진입
+            # 시장가 진입 (플래그를 주문 전에 설정해야 polling loop와의 race condition 방지)
+            _bot_executed_symbols.add(symbol)
             order_id = await client.place_market_order(
                 symbol, request.side, Decimal(request.qty)
             )
@@ -671,7 +721,11 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
                     if dca_id:
                         dca_order_ids.append(dca_id)
 
-            _bot_executed_symbols.add(symbol)
+            # DCA 주문 ID 추적 (나중에 체결 시 수동 추가매수로 오분류 방지)
+            if dca_order_ids:
+                if symbol not in _pending_bot_dca_ids:
+                    _pending_bot_dca_ids[symbol] = set()
+                _pending_bot_dca_ids[symbol].update(dca_order_ids)
             logger.info(f"market_entry completed: {symbol}")
             return {
                 "success": True,
@@ -760,6 +814,14 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
                     }
                 _trailing_stop_active.add(symbol)  # 성공 시 추적 등록
                 _known_sl_prices.pop(symbol, None)  # trailing stop 전환 시 고정 SL 가격 제거
+                # Bitget: trailing stop(track_plan)과 SL(pos_loss)이 독립 주문이므로 손익분기 SL 병행 설정
+                if client.exchange_id == "bitget":
+                    try:
+                        await client.set_stop_loss(symbol, position.entry_price)
+                        _known_sl_prices[symbol] = str(position.entry_price)  # breakeven SL 발동 시 MANUAL_CLOSE 오분류 방지
+                        logger.info(f"[adjust] Bitget breakeven SL set @ {position.entry_price} alongside trailing stop: {symbol}")
+                    except Exception as e:
+                        logger.warning(f"[adjust] Bitget breakeven SL failed (trailing stop still active): {symbol} — {e}")
             elif request.sl_price:
                 sl_set = await client.set_stop_loss(symbol, Decimal(str(request.sl_price)))
                 if sl_set:
@@ -793,6 +855,10 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
                     if dca_id:
                         dca_order_ids.append(dca_id)
 
+            # adjust에서 재배치된 DCA 주문 ID도 추적 (수동 추가매수 오분류 방지)
+            if dca_order_ids:
+                _pending_bot_dca_ids.setdefault(symbol, set()).update(dca_order_ids)
+
             logger.info(f"adjust completed: {symbol}")
             return {
                 "success": True,
@@ -809,9 +875,11 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
         raise
     except ExchangeError as e:
         logger.error(f"Exchange error in execute [{request.order_type}]: {e}")
+        await _post_error_to_central("exchange_error", "main.py", f"execute:{request.order_type}", str(e))
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected error in execute [{request.order_type}]: {e}")
+        await _post_error_to_central("unexpected", "main.py", f"execute:{request.order_type}", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -819,7 +887,7 @@ async def execute_order(request: Request, execute_req: ExecuteRequest):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "agent_variant": settings.agent_variant}
 
 
 # ===== 헬스체크 =====
